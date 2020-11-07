@@ -1,0 +1,434 @@
+---
+title: "Movielens project"
+author: "Anthony S N Maina"
+date: "November 2020"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### INTRODUCTION
+
+For this project, I have created a movie recommendation system using the MovieLens dataset. I have used a subset of the movielens data  included in the dslabs package.
+
+This project starts from the code provided to download and generate the subset of MovieLens data to be used for analysis. The code for generating the edx and validation datasets is thus not shown here.
+
+The data contains roughly 10 million records of movie ratings, with attributes related to the movies themselves (title, genre, year of release etc) as well as the users who rated the movies (userId, timestamp of rating etc)
+
+The goal of the project is to generate and run a model which takes these attributes for the validation sets, generates predicted ratings, and also computes the RMSE vs the actual ratings. 
+
+This report is split into the following sections:
+
+1) Exploratory Data Analysis
+2) Generation of Machine Leaning Model
+3) Results
+4) Discussion
+
+### EXPLORATORY DATA ANALYSIS
+
+We begin by simply scanning the form of the data in the edx dataset. The idea here is to get a sense of the format of the data in each column, and understand whether further manipulation is necessary to extract additionl information. 
+
+We start by initialising the necessary libraries and extracting a view of the first 6 rows of data
+
+```{r libraries, message = FALSE}
+library(lubridate)
+library(tidyverse)
+library(caret)
+library(data.table)
+library(anytime)
+library(stringr)
+```
+
+```{r}
+edx<-read.csv(file.path("edx.csv"), stringsAsFactors=FALSE)
+edx %>% head()
+```
+
+We see here that there are a few columns where some additional effort in data manipulation could yield more interesting attributes:
+
+ - Title - We notice that in each title, the release year is contained within parentheses.
+ - Timestamp - We notice that this is encoded as an integer, possibly containing info on the year, month, day and hour that the rating was generated
+ - Genres - We notice that this column contains multiple genre categories, which could potentially yield interesting results if separated and analysed separately
+ 
+ We carry out some operations in R to extract the necessary data - see code below
+
+
+```{r}
+edx["release_year"]<-str_sub(edx$title, -5,-2) # extracts the four last characters from the "title" attribute, starting from second last.
+edx["datetime"]<-edx$timestamp %>% anytime() # converts the timestamp variable into a date-time format
+edx["year"]<-edx$datetime %>% year() # extracts the year of the time stamp
+edx["month"]<-edx$datetime %>% month() # extracts the month of the time stamp
+edx["dow"]<-edx$datetime %>% wday() # extracts the day of the time stamp
+edx["hour"]<-edx$datetime %>% hour() # extracts the hour of the time stamp
+
+#extract a list of each of the individual genre names in the Genre column
+gen<-list()
+a_head<-unique(edx$genres)%>% strsplit('|', fixed=TRUE)
+for (j in 1:length(unique(edx$genres))) {
+    for (i in 1:length(a_head[[j]])) {
+        gen<-append(gen,a_head[[j]][i])
+    }
+}
+
+# Drop the duplicate genres
+gen<- gen %>% unique()
+
+# Generate a column for each indvidual genre category, and populate with "1"True" if the category is found in the Genres column, "False" if not
+for (i in 1:length(gen)) {
+    chars <- edx$genres
+    value <-gen[[i]][1]
+    edx[value]<-str_detect(chars, value)
+}
+
+# Re-name the columns with unexpected characters : "-", "(" and ")"
+names(edx)[names(edx) == 'Sci-Fi'] <- 'SciFi'
+names(edx)[names(edx) == 'Film-Noir'] <- 'FilmNoir'
+names(edx)[names(edx) == '(no genres listed)'] <- 'Blank'
+
+# Convert "True" and "False" labels into 1 and 0 respectively
+cols <- sapply(edx, is.logical)
+edx[,cols] <- lapply(edx[,cols], as.numeric)
+head(edx)
+```
+
+
+### Data Visualisation
+
+Having processed the data we are now in a position to examine the data in a little more detail.
+
+We begin by examining the basic distribution of the ratings. 
+
+```{r}
+#mean and standard deviation
+mu <- mean(edx$rating)
+mu
+s<-sd(edx$rating)
+s
+```
+
+
+```{r}
+# basic histograms
+p <- edx %>%
+    ggplot(aes(x = rating,  y = ..count..))
+p + geom_density(bw = 0.5)
+```
+
+The ratings have a negatively skewed distribution with a mean of 3.51 and a standard deviation of 1.06. Note here that standard deviation is nothing more than the RMSE vs the mean of the distribution. 
+
+We will examine the data by grouping the attributes in 2 main super-groups:
+
+1) Attributes related to the Movie ID (genre, release year)
+2) Attributes related to the User ID (timestamp)
+
+We should also note already that **the attributes here are only groupings of either userID related or movie ID related characteristics**
+
+#### Movie ID related attributes
+
+##### Number of ratings per movie 
+
+```{r message=FALSE}
+# VISUALISE NUMBER OF RATINGS PER MOVIE
+# How many movies?
+unique(edx$movieId) %>% length()
+
+#Distribution of ratings by movie?
+
+edx %>% 
+group_by(movieId) %>% 
+summarize(reviews_per_movie=n()) %>%
+ggplot(aes(x = reviews_per_movie)) +
+geom_histogram(bins=100) +
+scale_y_log10()
+```
+
+We see here that a significant number of movies have 5000 reviews or less, while a few have more than 20k reviews. Lets have a look first at how the more reviewed movies perform vs the average.
+
+```{r message=FALSE}
+edx %>% group_by(movieId) %>%
+  summarize(ratings_per_movie=n(), rating = mean(rating)) %>%
+  ggplot(aes(x = ratings_per_movie, y = rating-mu)) +
+  geom_point() +
+  geom_smooth() +
+  scale_x_log10()
+```
+We see here that movies with more reviews generally received higher ratings; with movies exceeding 10000 reviews receving scores higher than the mean. So we are saying a small number of very popular movies is responsible for dragging the overall score up.
+
+```{r message=FALSE}
+
+gen<-c("Comedy", "Romance", "Action", "Crime", "Thriller", "Drama", "SciFi","Adventure", "Children", "Fantasy", "War", "Animation", "Musical", "Western", "Mystery", "FilmNoir", "Horror", "Documentary", "IMAX", "Blank" )
+
+gen_sum <- data.frame("Genre"=c(), "Rating"=c(), "Number"=c())
+
+for (i in gen){
+  gen_sum<-rbind(gen_sum, data.frame("genre" = i, "genre_effect" = edx %>% filter (eval(as.symbol(i))==1) %>% .$rating %>% mean()-mu, "n" = edx %>% filter (eval(as.symbol(i))==1) %>% nrow()))
+}
+gen_sum
+```
+
+##### Year of release
+
+We next examine the variation in ratings vs year of release. 
+
+```{r message=FALSE}
+# VISUALISE TREND OVER TIME
+edx %>% 
+group_by(release_year) %>% 
+summarize (N=n(), release_year_effect = mean(rating)-mu, st_dev=sd(rating), median = median(rating), Tenth = quantile(rating, 0.1), Ninetieth = quantile(rating, 0.9)) %>%
+ggplot(aes(as.numeric(release_year), release_year_effect)) +
+geom_point() +
+geom_smooth()
+```
+We see here that the variation is significant, with movies released earlier generally greatly out-performing movies released more recently. Hipster much?
+
+#### User ID related attributes
+
+##### Number of ratings per user
+
+We start by looking at the number of ratings per user, and how these relate to the ratings given.
+
+```{r message=FALSE}
+# VISUALISE NUMBER OF RATINGS PER USER
+# How many users?
+
+unique(edx$userId) %>% length()
+
+# Distribution of ratings by user
+
+edx %>% 
+group_by(userId) %>% 
+summarize(reviews=n()) %>%
+ggplot(aes(x = reviews)) +
+geom_histogram(bins=100) +
+scale_y_log10()
+```
+We see hee that the majority of users have given fewer than 1000 reviews. But there is a significant tail of "super-users" who have given more than 1000, as well as a decent chunk who have given very few reviews.
+
+Lets see how this translates into the variation in reviews given.
+
+```{r message=FALSE}
+edx %>% group_by(userId) %>%
+  summarize(reviews_per_user=n(), rating = mean(rating)) %>%
+  ggplot(aes(x = reviews_per_user, y = rating-mu)) +
+  geom_point() +
+  geom_smooth() +
+  scale_x_log10()
+```
+Here we see that somewhat naturally, reviewers who give more reviews are generally harsher critics. 
+
+##### Timestamp
+
+We begin by looking at the effect of the year the review was given.
+
+
+```{r message=FALSE}
+# VISUALISE TREND OVER TIME
+edx %>% 
+group_by(year) %>% 
+summarize (N=n(), year_effect = mean(rating)-mu,st_dev=sd(rating), median = median(rating), Tenth = quantile(rating, 0.1), Ninetieth = quantile(rating, 0.9)) %>%
+ggplot(aes(year, year_effect)) +
+geom_point()
+
+```
+
+Here we see that reviews given more recently are generally lower vs the mean. So audiences are getting more critical as time goes on.
+
+Looking at the month:
+
+
+```{r message=FALSE}
+p <- edx %>%
+    ggplot(aes(rating, y = ..count.., group = month, fill = month))
+p + geom_density(alpha = 0.1, bw = 0.5) 
+
+edx %>% 
+group_by(month) %>% 
+summarize (N=n(), month_effect = mean(rating)-mu,st_dev=sd(rating), median = median(rating), Tenth = quantile(rating, 0.1), Ninetieth = quantile(rating, 0.9)) %>%
+ggplot(aes(month, month_effect)) +
+geom_point()
+```
+
+We see very small deviations from the mean, certainly not enough to swing from one rating to the next given the minimum step is 0.5.
+
+The story is similar for day of week (dow), and hour of day (hour)
+
+```{r message=FALSE}
+p <- edx %>%
+    ggplot(aes(rating, y = ..count.., group = dow, fill = dow))
+p + geom_density(alpha = 0.1, bw = 0.5) 
+
+edx %>% 
+group_by(dow) %>% 
+summarize (N=n(), dow_effect = mean(rating)-mu,st_dev=sd(rating), median = median(rating), Tenth = quantile(rating, 0.1), Ninetieth = quantile(rating, 0.9)) %>%
+ggplot(aes(dow, dow_effect)) +
+geom_point()
+```
+
+
+
+```{r message=FALSE}
+p <- edx %>%
+    ggplot(aes(rating, y = ..count.., group = hour, fill = hour))
+p + geom_density(alpha = 0.1, bw = 0.5) 
+
+edx %>% 
+group_by(hour) %>% 
+summarize (N=n(), hour_effect = mean(rating)-mu,st_dev=sd(rating), median = median(rating), Tenth = quantile(rating, 0.1), Ninetieth = quantile(rating, 0.9)) %>%
+ggplot(aes(hour, hour_effect)) +
+geom_point()
+```
+
+We now have done enough analysis to train our model.
+
+
+
+## Train model on subset of data
+
+We will train our model based on linear regression, using movieID and userID as our variables. We will carry out the following steps:
+
+1) Split the edx dataset into training and test groups, in order to select and tune our model
+2) Apply the tuned model to the validation dataset, and compute the resulting RMSE. 
+
+### Building the model
+
+First we split the edx dataset into train and test sets
+
+
+```{r message=FALSE}
+edx<-edx[,c("rating","title", "movieId", "userId")]
+
+set.seed(7)
+
+test_index <- createDataPartition(edx$rating, times = 1, p = 0.2, list = FALSE)
+
+train_set <- edx %>% slice(-test_index)
+
+test_set <- edx %>% slice(test_index)
+```
+
+#### Prediction based on mean
+
+This is the simplest possible algorithm, as it entails assuming the mean rating from the training dataset is applied uniformly to the test dataset. It produces an answer which is predictably not far off the standard deviation of the overall distribution.
+
+```{r message=FALSE}
+mu_train<-mean(train_set$rating)
+
+# RMSE based on avg alone
+s<-sqrt(mean((test_set$rating-mu_train)^2))
+s
+```
+
+#### Prediction based on userId and movie Id.
+
+We begin by calculating the "movie effect", which is simply the mean rating applied per movie less the mean rating. 
+
+```{r message=FALSE} 
+bi <- train_set %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = mean(rating - mu_train))
+head(bi)
+```
+
+We then calculate the incremental user effect, which is the mean rating per user, less the mean rating for the dataset as a whole, less the movie effect. 
+
+```{r message=FALSE}
+bu <- train_set %>% 
+  left_join(bi, by = "movieId") %>%
+  group_by(userId) %>%
+  summarize(b_u = mean(rating - mu_train - b_i))
+head(bu)
+```
+
+We are now ready to apply these two effects to the testing dataset, and compute the resulting RMSE.
+
+```{r message=FALSE}
+pred_bi_bu <- test_set %>% 
+  left_join(bi, by = "movieId") %>% 
+  left_join(bu, by = "userId")
+pred_bi_bu[is.na(pred_bi_bu)]<-0
+pred_bi_bu<-pred_bi_bu %>% mutate (pred_bi_bu = mu_train+b_i+b_u)
+sqrt(mean((pred_bi_bu$pred_bi_bu- test_set$rating)^2))
+pred_bi_bu %>% head()
+```
+
+We know that linear regression-based algorithms are sensitive to outliers (ie otherwise isolated datapoints with extreme RMSE values); so we introduce the lambda term to penalise for this; and compute the RMSE iteratively in order to select the lambda which will minimise RMSE on our test dataset.
+
+```{r message=FALSE}
+# lambda is a tuning parameter to penalise outliers
+lambdas <- seq(0, 10, 0.25)
+
+# For each lambda,find b_i & b_u, and then compute RMSE. NOTE: THIS TAKES A WHILE TO RUN
+rmses <- sapply(lambdas, function(l){
+  
+  b_i <- train_set %>% 
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu_train)/(n()+l))
+  
+  b_u <- train_set %>% 
+    left_join(b_i, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - b_i - mu_train)/(n()+l))
+  
+  predicted_ratings <- test_set %>% 
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    mutate(pred = mu_train + b_i + b_u) 
+  
+  predicted_ratings[is.na(predicted_ratings)] <-0
+
+  predicted_ratings <- predicted_ratings$pred
+  
+  return(RMSE(test_set$rating,predicted_ratings))
+})
+
+# Plot rmses vs lambdas to select the optimal lambda
+qplot(lambdas, rmses) 
+```
+
+
+We can see that this lambda falls on around 4.75. We now have a model to use on the Validation dataset.
+
+### RESULTS
+
+Below our model is applied to the Validation dataset to obtain a final RMSE
+
+
+```{r message=FALSE}
+validation<-fread("validation.csv")
+```
+
+```{r message=FALSE}
+l <- lambdas[which.min(rmses)]
+b_i <- train_set %>% 
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu_train)/(n()+l))
+
+b_u <- train_set %>% 
+    left_join(b_i, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - b_i - mu_train)/(n()+l))
+
+predicted_ratings <- validation%>% 
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    mutate(pred = mu_train + b_i + b_u) 
+
+predicted_ratings[is.na(predicted_ratings)] <-0
+
+predicted_ratings <- predicted_ratings$pred
+
+RMSE(predicted_ratings, validation$rating)
+```
+We have developed and tuned a ratings prediction model which uses userId and movieId as inputs, and achieves an RMSE of 0.8657 (vs a worst case of 1.06.)
+
+### DISCUSSION
+
+We note that this model would breaks down for either a new movie or a new user.
+
+We also note that although additional attributes were present related to the movies or users themselves, these would not reasonably be expected to give a better prediction than userId or movieID, since they are nothing more than aggregations of multiple movies and/or users. (For example, since a given user rates a given movie once, any grouping based on timestamp just an aggregation of ratings from  number of userId's. Likewise for any grouping based on genre is nothing more than an aggregation of ratings from a a number of movieId's.)
+
+This concludes this piece of work.
